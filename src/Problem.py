@@ -21,50 +21,50 @@ class Problem:
         density: float = 0.5,
         seed: int = 42,
     ):
-        rng = np.random.default_rng(seed)
-        self._alpha = alpha
-        self._beta = beta
-        cities = rng.random(size=(num_cities, 2))
-        cities[0, 0] = cities[0, 1] = 0.5
+        rng = np.random.default_rng(seed) # random generator with seed
+        self._alpha = alpha # cost coefficient
+        self._beta = beta # cost exponent
+        cities = rng.random(size=(num_cities, 2)) # random city positions
+        cities[0, 0] = cities[0, 1] = 0.5 # depot at center
 
-        self._graph = nx.Graph()
-        self._graph.add_node(0, pos=(cities[0, 0], cities[0, 1]), gold=0)
+        self._graph = nx.Graph() # create empty graph
+        self._graph.add_node(0, pos=(cities[0, 0], cities[0, 1]), gold=0) 
         for c in range(1, num_cities):
             self._graph.add_node(c, pos=(cities[c, 0], cities[c, 1]), gold=(1 + 999 * rng.random()))
 
-        tmp = cities[:, np.newaxis, :] - cities[np.newaxis, :, :]
-        d = np.sqrt(np.sum(np.square(tmp), axis=-1))
-        for c1, c2 in combinations(range(num_cities), 2):
+        tmp = cities[:, np.newaxis, :] - cities[np.newaxis, :, :] # pairwise differences: x1-x2, y1-y2
+        d = np.sqrt(np.sum(np.square(tmp), axis=-1)) # pairwise euclidean distances
+        for c1, c2 in combinations(range(num_cities), 2): 
             if rng.random() < density or c2 == c1 + 1:
                 self._graph.add_edge(c1, c2, dist=d[c1, c2])
 
-        assert nx.is_connected(self._graph)
+        assert nx.is_connected(self._graph) # ensure graph is connected
 
-    @property
+    @property # getter for graph
     def graph(self) -> nx.Graph:
         return nx.Graph(self._graph)
 
-    @property
+    @property # getter for alpha
     def alpha(self):
         return self._alpha
 
-    @property
+    @property # getter for beta
     def beta(self):
         return self._beta
 
-    def cost(self, path, weight):
+    def cost(self, path, weight): # cost of traveling path with load weight
         dist = nx.path_weight(self._graph, path, weight='dist')
         return dist + (self._alpha * dist * weight) ** self._beta
 
-    def baseline(self):
+    def baseline(self): # baseline solution cost
         total_cost = 0
         for dest, path in nx.single_source_dijkstra_path(
             self._graph, source=0, weight='dist'
-        ).items():
+        ).items(): # shortest paths from depot to all nodes
             cost = 0
-            for c1, c2 in zip(path, path[1:]):
-                cost += self.cost([c1, c2], 0)
-                cost += self.cost([c1, c2], self._graph.nodes[dest]['gold'])
+            for c1, c2 in zip(path, path[1:]): # for each edge in path
+                cost += self.cost([c1, c2], 0) # cost with zero load
+                cost += self.cost([c1, c2], self._graph.nodes[dest]['gold']) # cost with full load
             logging.debug(
                 f"dummy_solution: go to {dest} ({' > '.join(str(n) for n in path)} ({cost})"
             )
