@@ -26,7 +26,7 @@ def solution(p: Problem):
     4.  **Optimization Phase (GA)**: Runs a Genetic Algorithm.
         - If Beta is low (< 1.5): Runs standard Atomic GA.
         - If Beta is high (>= 1.5): Runs Split GA (virtual nodes) to optimize load management.
-    5.  **Refinement Phase (Local Search)**: Applies 2-Opt local search to untangle paths.
+    5.  **Refinement Phase (Local Search)**: Applies Swap local search to optimize load placement.
     6.  **Verification & Reporting**: Calculates the exact physical cost, prints summary to terminal,
         and saves a detailed report to 'reports/' folder.
 
@@ -113,19 +113,36 @@ def solution(p: Problem):
     # 3. Output: Returns a 2D dense matrix where M[i, j] is the shortest distance from node i to j.
 
     try:
+        # MATRIX 1: LINEAR DISTANCE
+        # Calculates the shortest path based on standard edge weights.
+        # Used for the first term of the cost function (linear distance).
         global_dist_matrix = nx.floyd_warshall_numpy(G, weight='dist')
+
+        # MATRIX 2: NON-LINEAR DISTANCE
+        # The cost function includes a heavy power operation: (alpha * dist * weight)^beta.
+        # We can mathematically decompose this into: (alpha^beta) * (weight^beta) * (dist^beta).
+        # Since 'dist' (distance between nodes) and 'beta' are constant throughout the 
+        # entire genetic algorithm evolution, we can pre-calculate the (dist^beta) term.
+        # Instead of calling the expensive pow() function millions of times inside the 
+        # fitness loop, we compute it ONCE here using vectorized NumPy operations.
+        # During the evolution, the cost calculation becomes a simple multiplication (O(1)).
+        # The cost function second term depends on (dist^beta).
+        # Since (a + b)^beta != a^beta + b^beta for beta > 1, we cannot simply power the sum.
+        # We must sum the powers.
+        
+        # We create a virtual graph where edge weights represent the non-linear cost contribution (d^beta).
+        # This allows us to run Floyd-Warshall again to get the correct non-linear path costs.
+        G_beta = G.copy()
+        for u, v, data in G_beta.edges(data=True):
+            data['dist_beta'] = data['dist'] ** p.beta
+            
+        # Running Floyd-Warshall on this graph gives us the path that minimizes sum(d^beta).
+        # entry [i][j] now contains the correct sum of powered edges, solving the overestimation bug.
+        global_res_matrix = nx.floyd_warshall_numpy(G_beta, weight='dist_beta')
+
     except Exception as e:
         print(f"[ERROR] Matrix computation failed: {e}")
         return None
-    
-    # The cost function includes a heavy power operation: (alpha * dist * weight)^beta.
-    # We can mathematically decompose this into: (alpha^beta) * (weight^beta) * (dist^beta).
-    # Since 'dist' (distance between nodes) and 'beta' are constant throughout the 
-    # entire genetic algorithm evolution, we can pre-calculate the (dist^beta) term.
-    # Instead of calling the expensive pow() function millions of times inside the 
-    # fitness loop, we compute it ONCE here using vectorized NumPy operations.
-    # During the evolution, the cost calculation becomes a simple multiplication (O(1)).
-    global_res_matrix = np.power(global_dist_matrix, p.beta)
     
     best_path = None
     best_cost_ub = float('inf')
@@ -167,10 +184,10 @@ def solution(p: Problem):
     if best_path is None:
         best_path = path_atomic
 
-    # --- 7. LOCAL REFINEMENT (2-OPT) ---
+    # --- 7. LOCAL REFINEMENT (SWAP SEARCH) ---
     # The GA provides us with a strong candidate solution, but it may contain suboptimal segments.
-    # We apply a 2-Opt local search to each individual trip (between depot returns) to untangle any crossing paths and reduce costs.
-    refined_path = refine_path_with_2opt(p, best_path, global_dist_matrix, global_res_matrix)
+    # We apply a Swap local search to each individual trip (between depot returns) to untangle any crossing paths and reduce costs.
+    refined_path = refine_path_with_local_search(p, best_path, global_dist_matrix, global_res_matrix)
     
     # --- 8. FINAL VERIFICATION & FORMATTING ---
     # If the refined path does not end with a return to the depot, we append it to ensure validity.
@@ -293,9 +310,9 @@ def calculate_path_real_cost_exact(p, graph_obj, path):
         prev_node = node
     return cost
 
-def refine_path_with_2opt(p, path, dist_matrix, res_matrix):
+def refine_path_with_local_search(p, path, dist_matrix, res_matrix):
     """
-    Post-Processing Phase: Applies 2-Opt Local Search to each sub-trip individually.
+    Post-Processing Phase: Applies Swap Local Search to each sub-trip individually.
     The full path consists of multiple trips separated by the Depot (0).
     We cannot swap nodes between different trips without re-evaluating the global load constraints.
     Therefore, we isolate each trip (Depot -> Cities -> Depot) and optimize its internal geometry.
@@ -306,7 +323,7 @@ def refine_path_with_2opt(p, path, dist_matrix, res_matrix):
         dist_matrix (np.ndarray): Pre-computed distance matrix for O(1) lookups.
         res_matrix (np.ndarray): Pre-computed matrix for O(1) lookups.
     Returns:
-        list[tuple]: The refined path after applying 2-Opt, in the format [(node_id, gold_collected), ..., (0, 0)]
+        list[tuple]: The refined path after applying Swap Local Search, in the format [(node_id, gold_collected), ..., (0, 0)]
     """
     final_path_structure = []
     current_trip = []
@@ -317,7 +334,7 @@ def refine_path_with_2opt(p, path, dist_matrix, res_matrix):
         if node == 0:
             if current_trip:
                 # Optimize the specific sequence of cities within this single trip.
-                optimized_trip = two_opt_on_sequence(p, current_trip, dist_matrix, res_matrix)
+                optimized_trip = swap_local_search(p, current_trip, dist_matrix, res_matrix)
                 final_path_structure.extend(optimized_trip)
                 current_trip = []
             # Explicitly add the depot return to the final structure
@@ -325,15 +342,31 @@ def refine_path_with_2opt(p, path, dist_matrix, res_matrix):
         else:
             # Build the current trip buffer
             current_trip.append(node_info)
+
+    # If the input path did NOT end with (0,0), the last trip is still sitting in 'current_trip'.
+    # We must process and flush it to avoid silently deleting valid cities from the solution.
+    if current_trip:
+        optimized_trip = swap_local_search(p, current_trip, dist_matrix, res_matrix)
+        final_path_structure.extend(optimized_trip)
+        final_path_structure.append((0, 0))
+
     return final_path_structure
 
-def two_opt_on_sequence(p, sequence, dist_matrix, res_matrix):
+def swap_local_search(p, sequence, dist_matrix, res_matrix):
     """
-    Core 2-Opt Algorithm: Untangles crossing paths by reversing segments.
-    
-    Mechanism:
-    It iteratively attempts to reverse every sub-segment of the route.
-    If a reversal results in a lower cost,the change is accepted immediately .
+    Implements a Local Search based on the Swap operator to optimize a specific route segment.
+    It iteratively explores the neighborhood of the current sequence by swapping pairs of nodes.
+    Since the cost function depends on the accumulated weight, a complete recalculation of the path cost 
+    is performed for each swap to ensure validity.
+
+    Args:
+        p (Problem): The problem instance containing global constants (alpha, beta).
+        sequence (list[tuple]): The current sub-trip sequence of nodes [(node_id, gold), ...].
+        dist_matrix (np.ndarray): Pre-computed distance matrix for O(1) lookups.
+        res_matrix (np.ndarray): Pre-computed geometric matrix for O(1) lookups.
+
+    Returns:
+        list[tuple]: The optimized sequence of nodes after applying local search.
     """
     best_seq = sequence
     alpha_pow_beta = p.alpha ** p.beta
@@ -375,13 +408,14 @@ def two_opt_on_sequence(p, sequence, dist_matrix, res_matrix):
         iter_count += 1
         n = len(best_seq)
 
-        # Try all possible pairs of indices (i, j) to reverse the segment between them
-        # i = start of segment, j = end of segment
+        # Try all possible pairs of indices (i, j) to SWAP them
         for i in range(n - 1):
             for j in range(i + 1, n):
-                # Construct new sequence: [Start] + [Reversed Middle] + [End]
-                # If best_seq is A-B-C-D and we swap B-C, we get A-C-B-D.
-                new_seq = best_seq[:i] + best_seq[i:j+1][::-1] + best_seq[j+1:]
+                # Construct new sequence using SWAP
+                # Swap node at i with node at j
+                new_seq = best_seq[:] # Create a copy
+                new_seq[i], new_seq[j] = new_seq[j], new_seq[i]
+                
                 new_cost = fast_seq_cost(new_seq)
 
                 if new_cost < best_cost:
@@ -577,10 +611,12 @@ def run_ga_solver(p: Problem, graph_obj, base_dist, base_res, split_factor=0.0):
         a, b = sorted(random.sample(range(size), 2))
         child = [-1] * size
         child[a:b+1] = p1[a:b+1]
+        genes_in_child = set(child[a:b+1])
         ptr = (b + 1) % size
         for gene in p2[b+1:] + p2[:b+1]:
-            if gene not in child:
+            if gene not in genes_in_child:
                 child[ptr] = gene
+                genes_in_child.add(gene) # Keep set updated just in case (though genes are unique)
                 ptr = (ptr + 1) % size
         return child
 
