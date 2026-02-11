@@ -14,9 +14,6 @@ TOURNAMENT_SIZE = 5        # Size of the tournament for parent selection
 MUTATION_RATE = 0.3        # Probability of flipping a sub-sequence (Inversion Mutation)
 ELITISM_SIZE = 2           # Number of best individuals kept unchanged across generations
 
-# If True, performs a final verification using exact Dijkstra traversal (slower but precise).
-EXACT_VERIFICATION = True 
-
 def solution(p: Problem):
     """
     Main entry point for the project solution.
@@ -121,7 +118,7 @@ def solution(p: Problem):
         print(f"[ERROR] Matrix computation failed: {e}")
         return None
     
-    #The cost function includes a heavy power operation: (alpha * dist * weight)^beta.
+    # The cost function includes a heavy power operation: (alpha * dist * weight)^beta.
     # We can mathematically decompose this into: (alpha^beta) * (weight^beta) * (dist^beta).
     # Since 'dist' (distance between nodes) and 'beta' are constant throughout the 
     # entire genetic algorithm evolution, we can pre-calculate the (dist^beta) term.
@@ -133,7 +130,7 @@ def solution(p: Problem):
     best_path = None
     best_cost_ub = float('inf')
 
-    # --- 4. BASELINE CALCULATION (SAFETY NET) ---
+    # --- 4. BASELINE CALCULATION ---
 
     # We generate a simple "Star Topology" path (Depot -> City -> Depot) for each city.
     # This rapresents our upper bound baseline valid solution.
@@ -156,6 +153,9 @@ def solution(p: Problem):
     
     # --- 6. SPLIT STRATEGY (VIRTUAL NODES GA) ---
     # Active only if Beta >= 1.5.
+    # In high-beta scenarios, the non-linear cost penalty for carrying large loads is severe.
+    # By creating virtual nodes for the heaviest cities, we allow the GA to optimize load management 
+    # by treating partial pickups as separate entities.
     if p.beta >= 1.5:
         path_split = run_ga_solver(p, G, global_dist_matrix, global_res_matrix, split_factor=0.25)
         cost_split_ub = calculate_path_cost_fast(p, path_split, global_dist_matrix, global_res_matrix)
@@ -168,12 +168,16 @@ def solution(p: Problem):
         best_path = path_atomic
 
     # --- 7. LOCAL REFINEMENT (2-OPT) ---
+    # The GA provides us with a strong candidate solution, but it may contain suboptimal segments.
+    # We apply a 2-Opt local search to each individual trip (between depot returns) to untangle any crossing paths and reduce costs.
     refined_path = refine_path_with_2opt(p, best_path, global_dist_matrix, global_res_matrix)
     
     # --- 8. FINAL VERIFICATION & FORMATTING ---
+    # If the refined path does not end with a return to the depot, we append it to ensure validity.
     if not refined_path or refined_path[-1] != (0, 0):
         refined_path.append((0, 0))
         
+    # Calculate the exact physical cost of the refined path by reconstructing the actual edges traversed in the original graph.
     final_real_cost = calculate_path_real_cost_exact(p, G, refined_path)
     
     # --- 9. AUTOMATIC REPORTING ---
@@ -245,13 +249,39 @@ def calculate_path_cost_fast(p, path, dist_matrix, res_matrix):
 def calculate_path_real_cost_exact(p, graph_obj, path):
     """
     Calculates the EXACT physical cost by reconstructing the path edge-by-edge.
+    
+    DIFFERENCE VS 'FAST' CALCULATION:
+    1. Granularity:
+       - The 'Fast' function treats the path between two cities as a single "macro-link" 
+         and applies the cost formula once to the total distance.
+       - This 'Exact' function uses Dijkstra to find the actual sequence of physical 
+         road segments (edges) connecting the two cities.
+         
+    2. Mathematical Rigor (Non-Linearity):
+       - Due to the non-linear exponent beta, (d1 + d2)^beta != d1^beta + d2^beta.
+       - The 'Fast' function is an approximation (Upper Bound if beta > 1).
+       - This function is the "Ground Truth": it sums the cost of every small edge individually.
+       
+    3. Performance:
+       - This function is computationally expensive (calls nx.shortest_path repeatedly).
+       - It should ONLY be used for final validation, NOT inside the Genetic Algorithm loop.
+
+    Args:
+        p (Problem): The problem instance containing global constants (alpha, beta).
+        graph_obj: The original graph object from the problem instance.
+        path (list[tuple]): The candidate solution (genome) to evaluate, in the format [(node_id, gold_collected), ..., (0, 0)].
+    Returns:
+        float: The exact total cost of the provided path.
     """
     cost = 0
     current_w = 0
     prev_node = 0
     
     for node, gold in path:
+        # We need to find the actual road segments between 'prev_node' and 'node'
         real_path_nodes = nx.shortest_path(graph_obj, prev_node, node, weight='dist')
+        # Iterate through every physical edge in the shortest path
+        # Example: To go from A to B, we might pass through x -> y -> z.
         for j in range(len(real_path_nodes) - 1):
             u = real_path_nodes[j]
             v = real_path_nodes[j+1]
@@ -265,31 +295,59 @@ def calculate_path_real_cost_exact(p, graph_obj, path):
 
 def refine_path_with_2opt(p, path, dist_matrix, res_matrix):
     """
-    Applies 2-Opt Local Search to untangle crossing paths.
+    Post-Processing Phase: Applies 2-Opt Local Search to each sub-trip individually.
+    The full path consists of multiple trips separated by the Depot (0).
+    We cannot swap nodes between different trips without re-evaluating the global load constraints.
+    Therefore, we isolate each trip (Depot -> Cities -> Depot) and optimize its internal geometry.
+
+    Args: 
+        p (Problem): The problem instance containing global constants (alpha, beta).
+        path (list[tuple]): The candidate solution (genome) to refine.
+        dist_matrix (np.ndarray): Pre-computed distance matrix for O(1) lookups.
+        res_matrix (np.ndarray): Pre-computed matrix for O(1) lookups.
+    Returns:
+        list[tuple]: The refined path after applying 2-Opt, in the format [(node_id, gold_collected), ..., (0, 0)]
     """
     final_path_structure = []
     current_trip = []
     
     for node_info in path:
         node, gold = node_info
+        # Check if we hit a Depot return
         if node == 0:
             if current_trip:
+                # Optimize the specific sequence of cities within this single trip.
                 optimized_trip = two_opt_on_sequence(p, current_trip, dist_matrix, res_matrix)
                 final_path_structure.extend(optimized_trip)
                 current_trip = []
+            # Explicitly add the depot return to the final structure
             final_path_structure.append((0, 0))
         else:
+            # Build the current trip buffer
             current_trip.append(node_info)
     return final_path_structure
 
 def two_opt_on_sequence(p, sequence, dist_matrix, res_matrix):
     """
-    Core 2-Opt mechanism: tries to reverse segments to minimize cost.
+    Core 2-Opt Algorithm: Untangles crossing paths by reversing segments.
+    
+    Mechanism:
+    It iteratively attempts to reverse every sub-segment of the route.
+    If a reversal results in a lower cost,the change is accepted immediately .
     """
     best_seq = sequence
     alpha_pow_beta = p.alpha ** p.beta
     
     def fast_seq_cost(seq):
+        '''
+        Calculates the cost of a given sequence of nodes using pre-computed matrices.
+        This is a specialized version of the cost function that operates on a simple list of nodes (without gold amounts)
+        and assumes the path starts and ends at the depot (0). It uses the pre-computed distance and geometric matrices for O(1) lookups.
+        Args:
+            seq (list[int]): A list of node indices representing the order of visits in the trip.   
+        Returns:
+            float: The total cost of the trip.
+        '''
         c = 0
         w = 0
         prev = 0
@@ -308,53 +366,92 @@ def two_opt_on_sequence(p, sequence, dist_matrix, res_matrix):
 
     best_cost = fast_seq_cost(best_seq)
     improved = True
-    max_iter = 50 
+    max_iter = 50 # safety cap to prevent infinite loops in pathological cases
     iter_count = 0
     
+    # keep optimizing as long as we find improvements and we haven't hit the iteration cap
     while improved and iter_count < max_iter:
         improved = False
         iter_count += 1
         n = len(best_seq)
+
+        # Try all possible pairs of indices (i, j) to reverse the segment between them
+        # i = start of segment, j = end of segment
         for i in range(n - 1):
             for j in range(i + 1, n):
+                # Construct new sequence: [Start] + [Reversed Middle] + [End]
+                # If best_seq is A-B-C-D and we swap B-C, we get A-C-B-D.
                 new_seq = best_seq[:i] + best_seq[i:j+1][::-1] + best_seq[j+1:]
                 new_cost = fast_seq_cost(new_seq)
+
                 if new_cost < best_cost:
                     best_seq = new_seq
                     best_cost = new_cost
                     improved = True
-                    break 
+                    break # restart the search from the new configuration immediately
             if improved: break
     return best_seq
 
 def run_ga_solver(p: Problem, graph_obj, base_dist, base_res, split_factor=0.0):
     """
-    Runs the Genetic Algorithm.
-    """
+    Runs the Genetic Algorithm. In this implementation, we have two modes:
+    1. Atomic GA (split_factor=0.0): Standard GA where each city is represented as a single node.
+    2. Split GA (split_factor > 0): We create virtual nodes for the top 'split_factor' percentage of cities 
+       with the highest gold amounts. This allows the GA to optimize load management by treating 
+       partial pickups as separate entities.
+    Args:
+        p (Problem): The problem instance containing global constants (alpha, beta).
+        graph_obj: The original graph object from the problem instance.
+        base_dist: The pre-computed distance matrix (Floyd-Warshall).
+        base_res: The pre-computed geometric matrix (distance^beta).
+        split_factor: A float between 0 and 1 indicating the percentage of cities to split into virtual nodes.
+
+    Returns:
+        list[tuple]: The best path found by the GA in the format [(node_id, gold_collected), ..., (0, 0)]
+        """
     original_num_cities = len(graph_obj.nodes)
     alpha = p.alpha
     beta = p.beta
     
     virtual_map = {} 
     original_gold = {}
+    
+    # For each original city, we check if it is in the top 'split_factor' percentage of gold amounts.
     for n in range(original_num_cities):
         original_gold[n] = graph_obj.nodes[n].get('gold', 0)
         
+    # We sort cities by gold amount without the city 0 (depot) in descending order. So the first cities in the sorted list are the richest ones.
     sorted_by_gold = sorted([(n, g) for n, g in original_gold.items() if n != 0], key=lambda x: x[1], reverse=True)
+
+    # Determine 'K': the number of cities to split based on the 'split_factor' hyperparameter.
+    # Example: If N=100 and split_factor=0.2, we select the top 20 heaviest cities.
     num_to_split = int((original_num_cities - 1) * split_factor)
+
+    # Extract the Node IDs of the top 'K' heaviest cities.
     nodes_to_split = set([n for n, _ in sorted_by_gold[:num_to_split]])
     
     expanded_gold = [] 
     expanded_to_original_idx = [] 
     current_id = 0
+
+    # Goal: Create an 'expanded' set of nodes where heavy cities are duplicated.
+    # This allows the Genetic Algorithm to visit a heavy city twice (picking up half load each time),
+    # significantly reducing the non-linear cost penalty (w^beta).
+
+    # Pass 1: Base Layer Creation
+    # Iterate through ALL original cities to create the primary instance of each node.
     
     for n in range(original_num_cities):
-        g = original_gold[n]
+        g = original_gold[n] 
+        # If the node is flagged for splitting, we only assign HALF of its gold 
+        # to this primary instance. The other half will be assigned to the 'clone' later.
         if n in nodes_to_split: g /= 2.0
         virtual_map[current_id] = n
         expanded_to_original_idx.append(n)
         expanded_gold.append(g)
         current_id += 1
+    
+    # Iterate again to create the SECOND instance (the clone) for the split cities.
     for n in range(original_num_cities):
         if n in nodes_to_split:
             g = original_gold[n] / 2.0 
@@ -363,15 +460,25 @@ def run_ga_solver(p: Problem, graph_obj, base_dist, base_res, split_factor=0.0):
             expanded_gold.append(g)
             current_id += 1
             
-    num_total_nodes = len(expanded_gold)
-    gold_amounts = np.array(expanded_gold)
+    num_total_nodes = len(expanded_gold) # update total number of nodes
+
+    # gold_amounts[i] gives the gold amount for the virtual node i. For non-split cities, this is the original gold. 
+    # For split cities, this is half of the original gold for both the primary and clone nodes.
+    gold_amounts = np.array(expanded_gold) 
     
-    indices = expanded_to_original_idx
-    dist_matrix = base_dist[np.ix_(indices, indices)]
-    res_matrix = base_res[np.ix_(indices, indices)]
+    indices = expanded_to_original_idx # update indices
+    dist_matrix = base_dist[np.ix_(indices, indices)] # update distance matrix
+    res_matrix = base_res[np.ix_(indices, indices)] # update matrix
     alpha_pow_beta = alpha ** beta
 
     def get_trip_chain_cost(sequence):
+        '''
+        Calculates the cost of a trip chain (a sequence of virtual nodes) using the pre-computed matrices.
+        Args:
+            sequence (list[int]): A list of virtual node indices representing the trip chain.
+        Returns:
+            float: The total cost of the trip chain.
+        '''
         cost = 0
         current_w = 0
         prev = 0 
@@ -389,30 +496,45 @@ def run_ga_solver(p: Problem, graph_obj, base_dist, base_res, split_factor=0.0):
         return cost
 
     def evaluate_genome(genome):
+        '''
+        Evaluates the total cost of a given genome (a sequence of virtual nodes) by reconstructing the path and 
+        calculating the cost using the pre-computed matrices. Implements a 'Greedy Split' strategy to minimize non-linear costs.
+
+        Args:
+            genome (list[int]): A list of virtual node indices representing the order of visits in the GA solution.
+        Returns:
+            tuple: (total_cost, final_path) where total_cost is the scalar cost of the genome and final_path is the 
+                   reconstructed path in the format [(original_node_id, gold_collected), ..., (0, 0)].
+        '''
         final_path = []
         current_trip = []
         total_cost = 0
         
+        # Iterate through sequence of cities suggested by the Genetic Algorithm
         for city in genome:
+            # Create a temporary trip extending the current one with the new city and calculate its cost.
             test_trip = current_trip + [city]
             cost_merged = get_trip_chain_cost(test_trip)
             
+            # if current_trip is empty, we start a new trip with the current city, we must add it without comparison
             if not current_trip:
                 current_trip.append(city)
                 continue
             
+            # Calculate cost of closing the current trip NOW (return to depot) and starting a new trip with the new city.
             cost_current_closed = get_trip_chain_cost(current_trip)
             cost_new_single = get_trip_chain_cost([city])
             
-            if cost_merged <= (cost_current_closed + cost_new_single):
+            if cost_merged <= (cost_current_closed + cost_new_single): # cheaper to continue
                 current_trip.append(city)
             else:
                 total_cost += cost_current_closed
-                for node in current_trip:
+                for node in current_trip: # cheaper to close current trip and start new one
                     final_path.append((virtual_map[node], gold_amounts[node]))
-                final_path.append((0, 0))
+                final_path.append((0, 0)) # return to depot: -> (0, 0)
                 current_trip = [city]
-                
+
+        # After processing all cities, if there is an open trip, we must close it by returning to the depot.    
         if current_trip:
             total_cost += get_trip_chain_cost(current_trip)
             for node in current_trip:
@@ -421,7 +543,15 @@ def run_ga_solver(p: Problem, graph_obj, base_dist, base_res, split_factor=0.0):
             
         return total_cost, final_path
 
-    def generate_greedy_seed():
+    def generate_greedy_genome():
+        '''
+        Generates a greedy solution for the GA by always visiting the nearest unvisited city next.
+        This provides a strong starting point for the GA to evolve from, especially in low-beta scenarios 
+        where distance is more critical.
+
+        Returns:
+            list[int]: A list of virtual node indices representing the greedy path.
+        '''
         unvisited = list(range(1, num_total_nodes))
         tour = []
         curr = 0
@@ -433,6 +563,16 @@ def run_ga_solver(p: Problem, graph_obj, base_dist, base_res, split_factor=0.0):
         return tour
 
     def crossover_ox1(p1, p2):
+        '''
+        Implements Order Crossover (OX1) for TSP-like problems. It creates a child by taking a random segment 
+        from parent 1 and filling the remaining genes in the order they appear in parent 2.
+        
+        Args:
+            p1 (list[int]): Parent 1 genome (sequence of virtual node indices).
+            p2 (list[int]): Parent 2 genome (sequence of virtual node indices).
+        Returns:
+            list[int]: The child genome resulting from the crossover.
+        '''
         size = len(p1)
         a, b = sorted(random.sample(range(size), 2))
         child = [-1] * size
@@ -445,6 +585,15 @@ def run_ga_solver(p: Problem, graph_obj, base_dist, base_res, split_factor=0.0):
         return child
 
     def mutate_inversion(genome):
+        '''
+        Implements Inversion Mutation by selecting a random segment of the genome and reversing it.
+        This mutation is effective for TSP-like problems as it can significantly alter the path structure,
+        allowing the algorithm to escape local minima.
+        Args:
+            genome (list[int]): The genome to mutate (sequence of virtual node indices).
+        Returns:
+            list[int]: The mutated genome.
+        '''
         if random.random() < MUTATION_RATE:
             size = len(genome)
             a, b = sorted(random.sample(range(size), 2))
@@ -454,38 +603,73 @@ def run_ga_solver(p: Problem, graph_obj, base_dist, base_res, split_factor=0.0):
     # --- Evolution Loop ---
     cities_indices = list(range(1, num_total_nodes))
     population = []
-    population.append(generate_greedy_seed())
+    population.append(generate_greedy_genome()) # start with a greedy solution to give the GA a strong initial candidate 
+
+    # Randomly generate the rest of the initial population by shuffling the city indices.
     for _ in range(POPULATION_SIZE - 1):
         ind = cities_indices[:]
         random.shuffle(ind)
         population.append(ind)
 
+    # Evaluate initial population and sort by fitness (cost) - Generation 0
     scored_pop = []
     for genome in population:
-        cost, _ = evaluate_genome(genome)
+        cost, _ = evaluate_genome(genome) 
         scored_pop.append((cost, genome))
     
+    # Sort by Cost Ascending (Lower is better).
+    # scored_pop[0] becomes the current best solution (Elite)
     scored_pop.sort(key=lambda x: x[0])
+
+    # Track the Global Best solution found so far across all generations.
     best_fitness = scored_pop[0][0]
     best_genome = list(scored_pop[0][1])
 
+    # Iterate through the evolutionary process
     for gen in range(GENERATIONS):
-        new_pop = [g for _, g in scored_pop[:ELITISM_SIZE]]
+        # --- ELITISM ---
+        # Directly copy the top N best individuals to the next generation.
+        # This guarantees that the best solution found is never lost due to destructive crossover/mutation.
+        new_pop = [list(g) for _, g in scored_pop[:ELITISM_SIZE]]
+
+        # --- OFFSPRING GENERATION ---
+        # Fill the rest of the new population until we reach POPULATION_SIZE.
         while len(new_pop) < POPULATION_SIZE:
+            # Tournament Selection for Parent 1:
+            # Pick 'TOURNAMENT_SIZE' random individuals and select the one with lowest cost.
             candidates = random.sample(scored_pop, TOURNAMENT_SIZE)
             p1 = min(candidates, key=lambda x: x[0])[1]
+
+            # Tournament Selection for Parent 2:
             candidates = random.sample(scored_pop, TOURNAMENT_SIZE)
             p2 = min(candidates, key=lambda x: x[0])[1]
-            new_pop.append(mutate_inversion(crossover_ox1(p1, p2)))
+
+            # Crossover (OX1): Combine parents' traits preserving order.
+            # Mutation (Inversion): Apply small random changes to escape local minima.
+            child = mutate_inversion(crossover_ox1(p1, p2))
+            # Add child to the new population
+            new_pop.append(child)
+        
+        # Replace the old population with the new generation
         population = new_pop
+
+        # --- RE-EVALUATION ---
+        # Calculate fitness for the new generation.
         scored_pop = []
         for genome in population:
             cost, _ = evaluate_genome(genome)
             scored_pop.append((cost, genome))
+
+            # Update Global Best if we found a new record low cost.
             if cost < best_fitness:
                 best_fitness = cost
                 best_genome = list(genome)
+        
+        # Sort again to prepare for the next generation's Elitism and Selection.
         scored_pop.sort(key=lambda x: x[0])
+
+    # Take the absolute best genome found and reconstruct the full path.
+    # We ignore the cost return (_) here because we only need the path.
     _, final_path = evaluate_genome(best_genome)
     return final_path
 
@@ -494,7 +678,7 @@ def write_report_to_file(p, G, path, my_cost, filename, density):
     Generates the detailed text report required for the assignment.
     Includes Performance Comparison, City Coverage, and Trip Log.
     """
-    # 1. Calculate Baseline for comparison using the OFFICIAL method
+    # Calculate Baseline for comparison using the OFFICIAL method
     prof_cost = p.baseline()
     
     improvement = prof_cost - my_cost
@@ -574,10 +758,8 @@ def print_terminal_minimal_report(p, G, my_cost, report_path):
     print(f" Full Report:     {report_path}")
     print("="*60 + "\n")
 
-# --- MAIN BLOCK (PROTECTED) ---
+# --- MAIN BLOCK ---
 if __name__ == "__main__":
-    # This block executes ONLY if you run this file directly.
-    # It is ignored if imported by the professor's script (import s347245).
     print("Running Test Suite for s347245...")
     
     # Comprehensive Test Cases (N, Density, Alpha, Beta)
@@ -601,5 +783,5 @@ if __name__ == "__main__":
         print(f"\n>>> Running Test: Cities={n}, Density={d}, Alpha={a}, Beta={b}")
         p = Problem(n, density=d, alpha=a, beta=b, seed=42)
         solution(p)
-    
+
     print("\nAll tests completed.")
