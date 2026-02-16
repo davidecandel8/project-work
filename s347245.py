@@ -4,6 +4,7 @@ from Problem import Problem
 import random
 import time
 import os
+import pprint
 import sys
 
 # --- HYPERPARAMETERS ---
@@ -38,6 +39,9 @@ def solution(p: Problem):
                      Returns None if input is invalid.
     """
     
+    # Start timer to measure total execution time for reporting
+    start_time = time.time()
+
     # --- 0. INPUT VALIDATION ---
     # Handle None input gracefully
     if p is None:
@@ -193,17 +197,114 @@ def solution(p: Problem):
     # If the refined path does not end with a return to the depot, we append it to ensure validity.
     if not refined_path or refined_path[-1] != (0, 0):
         refined_path.append((0, 0))
+
+    # Convert logical hops (A -> C) into physical steps (A -> B -> C)
+    final_expanded_path = expand_path(G, refined_path)
+    
+    # Verify that every step corresponds to an existing edge (Direct Adjacency)
+    is_admissible = check_path_validity_strict(G, final_expanded_path)
+    
+    if not is_admissible:
+        print("Expanded path is invalid. Reverting to Star Topology (Expanded).")
+        final_expanded_path = expand_path(G, path_star)
         
     # Calculate the exact physical cost of the refined path by reconstructing the actual edges traversed in the original graph.
     final_real_cost = calculate_path_real_cost_exact(p, G, refined_path)
     
     # --- 9. AUTOMATIC REPORTING ---
+
+    # Stop timer and calculate elapsed time for reporting
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+
     print_terminal_minimal_report(p, G, final_real_cost, report_path)
-    write_report_to_file(p, G, refined_path, final_real_cost, report_path, calculated_density)
-    
-    return refined_path
+    write_report_to_file(p, G, final_expanded_path, final_real_cost, report_path, calculated_density, elapsed_time)
+
+    return final_expanded_path
 
 # --- HELPER FUNCTIONS ---
+
+def expand_path(graph_obj, logical_path):
+    """
+    Expands a logical path (list of target stops) into a full path by filling gaps 
+    with the shortest path nodes.
+    
+    Example: 
+        Input:  [(A, np.float64(100)), (C, np.float64(50))] where A->B->C
+        Output: [(0, 0), (A, 100), (B, 0), (C, 50), (0, 0)]
+    
+    Args:
+        graph_obj: The NetworkX graph.
+        logical_path: List of tuples [(node, gold), ...]
+    
+    Returns:
+        list[tuple]: The expanded path where transit nodes have 0 gold.
+    """
+    if not logical_path:
+        return []
+        
+    full_path = []
+
+    # We create a working copy of the logical path to avoid mutating the original input.
+    working_path = list(logical_path)
+    
+    # If the first node is not the depot (0), we insert the depot at the beginning.
+    if not working_path or working_path[0][0] != 0:
+        working_path.insert(0, (0, 0.0))
+        
+    # If the last node is not the depot (0), we append the depot at the end to ensure a valid return.
+    if working_path[-1] != (0, 0):
+        working_path.append((0, 0.0))
+    
+    # Explicit casting to ensure clean types
+    start_n, start_g = working_path[0]
+    full_path.append((int(start_n), float(start_g)))
+    
+    # Iterate through pairs of consecutive nodes in the corrected working path.
+    for i in range(len(working_path) - 1):
+        start_node, _ = working_path[i]
+        end_node, end_gold = working_path[i+1]
+        
+        # If the start and end nodes are the same, we skip.
+        if start_node == end_node:
+            continue
+            
+        try:
+            # Dijkstra gives us the actual sequence of nodes we pass through.
+            # Example: start=0, end=15. Path found: [0, 4, 12, 15]
+            physical_steps = nx.shortest_path(graph_obj, source=start_node, target=end_node, weight='dist')
+            
+            # We skip the first node because it is already in full_path (from previous iteration or init)
+            for step_node in physical_steps[1:]:
+                # Only the final target node carries the gold specified in the logical path.
+                gold_amount = end_gold if step_node == end_node else 0
+                
+                clean_node = int(step_node)
+                clean_gold = float(gold_amount)
+                
+                full_path.append((clean_node, clean_gold))
+                
+        except nx.NetworkXNoPath:
+            # Fallback: In a connected graph (guaranteed by Problem.py), this should not happen.
+            # If it does, we append the node to avoid crashing, but it will likely fail validity checks.
+            full_path.append((int(end_node), float(end_gold)))
+            
+    return full_path
+
+def check_path_validity_strict(graph_obj, path):
+    """
+    Verifies PHYSICAL ADJACENCY.
+    Returns True only if G.has_edge(u, v) is True for all consecutive u, v.
+    """
+    if not path or len(path) < 2:
+        return True
+        
+    for (node_a, _), (node_b, _) in zip(path, path[1:]):
+        if node_a == node_b: continue
+        # Strict check: Edge must exist
+        if not graph_obj.has_edge(node_a, node_b):
+            return False
+    return True
 
 def generate_star_path(graph_obj):
     """
@@ -709,24 +810,30 @@ def run_ga_solver(p: Problem, graph_obj, base_dist, base_res, split_factor=0.0):
     _, final_path = evaluate_genome(best_genome)
     return final_path
 
-def write_report_to_file(p, G, path, my_cost, filename, density):
+def write_report_to_file(p, G, path, my_cost, filename, density, elapsed_time):
     """
     Generates the detailed text report required for the assignment.
     Includes Performance Comparison, City Coverage, and Trip Log.
     """
-    # Calculate Baseline for comparison using the OFFICIAL method
+    # Calculate Baseline for comparison using the professor's method
     prof_cost = p.baseline()
     
     improvement = prof_cost - my_cost
     improvement_pct = (improvement / prof_cost * 100) if prof_cost > 0 else 0
     outcome = "IMPROVEMENT" if improvement > 0 else "NO IMPROVEMENT"
     
+    # 1. Calcolo preliminare dell'oro raccolto per ogni città per fare la percentuale
+    collected_per_city = {n: 0.0 for n in G.nodes()}
+    for node, gold in path:
+        collected_per_city[node] += gold
+
     with open(filename, "w", encoding='utf-8') as f:
         # Header
         f.write("COMPUTATIONAL INTELLIGENCE PROJECT REPORT\n")
         f.write("=========================================\n")
         f.write(f"Student: s347245\n")
         f.write(f"Parameters: Alpha={p.alpha:.2f}, Beta={p.beta:.2f}, Density={density:.2f}, Cities={len(G.nodes)}\n")
+        f.write(f"Execution Time: {elapsed_time:.4f} seconds\n")
         f.write("=========================================\n\n")
         
         # PERFORMANCE COMPARISON
@@ -740,22 +847,26 @@ def write_report_to_file(p, G, path, my_cost, filename, density):
         
         # CITY COVERAGE DETAIL
         f.write("CITY COVERAGE DETAIL:\n")
-        f.write(f"{'City ID':<10} | {'Available':<12} | {'Visits':<8}\n")
-        f.write("-" * 35 + "\n")
+        f.write(f"{'City ID':<10} | {'Available':<12} | {'% Collected':<12} | {'Visits':<8}\n")
+        f.write("-" * 50 + "\n")
         
         city_stats = {}
         for n in G.nodes():
             if n == 0: continue
-            city_stats[n] = {'available': G.nodes[n].get('gold', 0), 'visits': 0}
+            city_stats[n] = {'visits': 0}
 
         for node, _ in path:
             if node != 0:
                 city_stats[node]['visits'] += 1
                 
         for cid in sorted(city_stats.keys()):
-            avail = city_stats[cid]['available']
+            avail = G.nodes[cid].get('gold', 0)
+            collected = collected_per_city[cid]
             visits = city_stats[cid]['visits']
-            f.write(f"{cid:<10} | {avail:<12.1f} | {visits:<8}\n")
+            
+            pct = (collected / avail * 100) if avail > 0 else 100.0
+            
+            f.write(f"{cid:<10} | {avail:<12.1f} | {pct:<12.1f} | {visits:<8}\n")
         f.write("\n")
 
         # TRIP LOG
@@ -776,6 +887,11 @@ def write_report_to_file(p, G, path, my_cost, filename, density):
                     trip_count += 1
             else:
                 current_trip.append((node, gold))
+        
+        f.write("\nFINAL SOLUTION PATH:\n")
+        f.write("-" * 60 + "\n")
+        f.write(pprint.pformat(path, width=80, compact=True))
+        f.write("\n")
 
 def print_terminal_minimal_report(p, G, my_cost, report_path):
     """
@@ -787,7 +903,7 @@ def print_terminal_minimal_report(p, G, my_cost, report_path):
     improvement_pct = ((prof_cost - my_cost) / prof_cost * 100) if prof_cost > 0 else 0
     
     print("\n" + "="*60)
-    print(f" [s347245] OPTIMIZATION COMPLETE")
+    print(f" [s347245]")
     print("-" * 60)
     print(f" Final Cost:      {my_cost:,.1f}")
     print(f" Improvement:     {improvement_pct:.2f}% vs Baseline")
